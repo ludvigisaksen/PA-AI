@@ -249,12 +249,15 @@ async function handleKeepDrop(message) {
     const createdTasks = await createTasksInCatalyst(enriched);
 
     await message.reply(`Stored ${createdTasks.length} task(s) in the PA.`);
-    // Optionally clear batch after storing
+    await logToAgentLog(
+      `keep success: sent ${enriched.length} task(s), Catalyst returned ${createdTasks.length}.`
+    );
+    // Clear batch after successful store
     lastTaskBatch = { tasks: [], sourceRef: null, meta: null };
   } catch (err) {
     console.error('handleKeepDrop error:', err);
     await message.reply('Error while storing tasks in the PA.');
-    await logToAgentLog(`handleKeepDrop error: ${err.message}`);
+    await logToAgentLog(`keep error: ${err.message}`);
   }
 }
 

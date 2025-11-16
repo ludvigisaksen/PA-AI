@@ -14,35 +14,46 @@ if (!CATALYST_BASE_URL) {
   );
 }
 
+function buildResponseSnippet(text = '', max = 180) {
+  if (!text) return '';
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+function sanitizeTaskForCatalyst(task) {
+  const sanitized = {
+    title: typeof task.title === 'string' && task.title.trim()
+      ? task.title.trim()
+      : 'Untitled task',
+    context: typeof task.context === 'string' ? task.context : '',
+    status: task.status || 'open'
+  };
+
+  if (task.id) sanitized.id = task.id;
+  if (task.due) sanitized.due = task.due;
+  if (task.priority_hint) sanitized.priority_hint = task.priority_hint;
+  if (task.project_hint) sanitized.project_hint = task.project_hint;
+  if (task.project_id) sanitized.project_id = task.project_id;
+  if (task.source_ref) sanitized.source_ref = task.source_ref;
+
+  return sanitized;
+}
+
 /**
  * Create tasks in Catalyst.
  * @param {Array<object>} tasks - canonical_event.tasks, enriched with source_ref etc.
- * @returns {Promise<Array<object>>} tasks returned from Catalyst or [] on failure.
+ * @returns {Promise<Array<object>>} tasks returned from Catalyst.
  */
 export async function createTasksInCatalyst(tasks) {
   if (!Array.isArray(tasks) || tasks.length === 0) {
-    return [];
+    throw new Error('createTasksInCatalyst called with no tasks to persist');
   }
 
   if (!CATALYST_BASE_URL) {
-    console.error(
-      '[catalyst] No base URL configured – skipping task creation and returning [].'
-    );
-    return [];
+    throw new Error('CATALYST_BASE_URL is not configured');
   }
 
   const payload = {
-    tasks: tasks.map((t) => ({
-      id: t.id || null,
-      title: t.title || '',
-      context: t.context || '',
-      status: t.status || 'open',
-      due: t.due || null,
-      priority_hint: t.priority_hint || null,
-      project_id: t.project_id || null,
-      project_hint: t.project_hint || null,
-      source_ref: t.source_ref || null
-    }))
+    tasks: tasks.map(sanitizeTaskForCatalyst)
   };
 
   try {
@@ -55,25 +66,38 @@ export async function createTasksInCatalyst(tasks) {
       body: JSON.stringify(payload)
     });
 
+    const respText = await resp.text().catch(() => '');
+
     if (!resp.ok) {
-      const text = await resp.text().catch(() => '');
-      console.error(
-        `[catalyst] Failed to POST /state/tasks (${resp.status}): ${text}`
+      throw new Error(
+        `[catalyst] POST /state/tasks failed (${resp.status}): ${buildResponseSnippet(respText)}`
       );
-      return [];
     }
 
-    const data = await resp.json().catch(() => null);
-    if (data && Array.isArray(data.tasks)) {
-      return data.tasks;
+    let data = null;
+    if (respText) {
+      try {
+        data = JSON.parse(respText);
+      } catch (err) {
+        throw new Error(
+          `[catalyst] Could not parse /state/tasks response JSON: ${buildResponseSnippet(respText)}`
+        );
+      }
     }
 
-    console.error(
-      '[catalyst] POST /state/tasks succeeded but response shape was unexpected.'
-    );
-    return [];
+    if (!data || !Array.isArray(data.tasks)) {
+      throw new Error('[catalyst] Response missing tasks array');
+    }
+
+    if (!data.tasks.length) {
+      throw new Error('[catalyst] Response did not return any created tasks');
+    }
+
+    return data.tasks;
   } catch (err) {
-    console.error('[catalyst] Error calling /state/tasks:', err);
-    return [];
+    if (err?.message?.startsWith('[catalyst]')) {
+      throw err;
+    }
+    throw new Error(`[catalyst] Error calling /state/tasks: ${err.message}`);
   }
 }
