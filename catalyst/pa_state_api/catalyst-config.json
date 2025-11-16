@@ -1,0 +1,10 @@
+{
+  "execution": {
+    "main": "index.js"
+  },
+  "deployment": {
+    "stack": "node20",
+    "name": "pa_state_api",
+    "type": "advancedio"
+  }
+}
