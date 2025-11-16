@@ -17,13 +17,31 @@ function ymdOrNull(val) {
 
 // Parse JSON body safely for Advanced I/O
 function parseJsonBody(request) {
-  try {
-    if (request && typeof request.requestBody === 'string') {
-      return JSON.parse(request.requestBody || '{}');
-    }
-  } catch (e) {
-    console.error('Error parsing JSON body:', e);
+  if (!request) return {};
+
+  // Some Catalyst setups provide an already parsed body
+  if (request.body && typeof request.body === 'object' && !Buffer.isBuffer(request.body)) {
+    return request.body;
   }
+
+  const candidates = [request.body, request.rawBody, request.requestBody];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+
+    if (typeof candidate === 'string') {
+      const trimmed = candidate.trim();
+      if (!trimmed) return {};
+      return JSON.parse(trimmed);
+    }
+
+    if (Buffer.isBuffer(candidate)) {
+      const str = candidate.toString('utf8').trim();
+      if (!str) return {};
+      return JSON.parse(str);
+    }
+  }
+
   return {};
 }
 
@@ -95,8 +113,19 @@ async function handlePostTasks(app, request, response) {
   const datastore = app.datastore();
   const tasksTable = datastore.table('tasks');
 
-  const body = parseJsonBody(request);
-  const incomingTasks = Array.isArray(body.tasks) ? body.tasks : [];
+  let body;
+  try {
+    body = parseJsonBody(request);
+  } catch (err) {
+    console.error('Invalid JSON in POST /state/tasks:', err);
+    return sendJson(response, 400, { error: 'Invalid JSON body' });
+  }
+
+  const incomingTasks = Array.isArray(body.tasks) ? body.tasks : null;
+
+  if (!incomingTasks) {
+    return sendJson(response, 400, { error: 'Body must include tasks array' });
+  }
 
   const savedTasks = [];
 
@@ -139,6 +168,15 @@ async function handlePostTasks(app, request, response) {
       created_at: row.CREATED_TIME,
       updated_at: row.MODIFIED_TIME
     });
+  }
+
+  console.log('[POST /state/tasks]', {
+    body,
+    persisted: savedTasks.length
+  });
+
+  if (!savedTasks.length) {
+    return sendJson(response, 400, { error: 'No valid tasks provided' });
   }
 
   sendJson(response, 200, { tasks: savedTasks });
