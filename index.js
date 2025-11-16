@@ -1,294 +1,198 @@
-// index.js
-import 'dotenv/config';
-import http from 'http';
-import {
-  Client,
-  GatewayIntentBits,
-  Partials
-} from 'discord.js';
+// catalyst/pa_state_api/index.js
+//
+// Advanced I/O function for PA state API.
+// Exposes:
+//   GET  /state/tasks
+//   POST /state/tasks
+//   GET  /state/projects
+//   POST /state/projects
+//
+// Storage is kept in-memory per function instance (OK for MVP).
+// Contract matches what the bridge expects:
+//   - JSON { tasks: [...] } for tasks endpoints
+//   - JSON { projects: [...] } for projects endpoints
 
-import { runSummarizerWorkflow } from './services/openai.js';
-import { createTasksInCatalyst } from './services/catalyst.js';
-import { parseKeepDrop } from './services/parseKeepDrop.js';
-import { extractLastLogBlock } from './services/extractLastLogBlock.js';
+// ----------- Helpers -----------
 
-const {
-  DISCORD_TOKEN,
-  DISCORD_INPUT_CHANNEL_ID,
-  DISCORD_INBOX_CHANNEL_ID,
-  DISCORD_LOG_CHANNEL_ID,
-  LUDVIG_USER_ID
-} = process.env;
-
-// ---- Soft env validation (no hard throws so Cloud Run can start) ----
-
-function envMissing(name) {
-  console.error(`[config] Missing required env var: ${name}`);
-  return false;
-}
-
-const DISCORD_CONFIG_OK =
-  !!DISCORD_TOKEN ||
-  !envMissing('DISCORD_TOKEN');
-
-const INPUT_OK =
-  !!DISCORD_INPUT_CHANNEL_ID ||
-  !envMissing('DISCORD_INPUT_CHANNEL_ID');
-
-const INBOX_OK =
-  !!DISCORD_INBOX_CHANNEL_ID ||
-  !envMissing('DISCORD_INBOX_CHANNEL_ID');
-
-const LUDVIG_OK =
-  !!LUDVIG_USER_ID ||
-  !envMissing('LUDVIG_USER_ID');
-
-const CAN_START_DISCORD =
-  DISCORD_CONFIG_OK && INPUT_OK && INBOX_OK && LUDVIG_OK;
-
-// In-memory last task batch (simple v1)
-let lastTaskBatch = {
-  tasks: [],
-  sourceRef: null,
-  meta: null
-};
-
-// ---------- Discord client ----------
-
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ],
-  partials: [Partials.Channel, Partials.Message]
-});
-
-client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-});
-
-client.on('error', (err) => {
-  console.error('Discord client error:', err);
-});
-
-// Helper: safe log to #agent-log
-async function logToAgentLog(text) {
+function sendJson(response, statusCode, body) {
   try {
-    if (!DISCORD_LOG_CHANNEL_ID) return;
-    const ch = await client.channels.fetch(DISCORD_LOG_CHANNEL_ID);
-    if (!ch || !ch.isTextBased()) return;
-    await ch.send(`⚠️ ${text}`);
+    response.setStatusCode(statusCode);
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify(body || {}));
   } catch (err) {
-    console.error('Failed to log to #agent-log:', err);
+    // Worst-case fallback if response helpers blow up
+    try {
+      response.setStatusCode(500);
+      response.setHeader('Content-Type', 'application/json');
+      response.end(JSON.stringify({ error: 'Response serialization error' }));
+    } catch (_) {
+      // nothing else we can do
+    }
   }
 }
 
-// Core trigger detection in #agent-input
-function isSummarizeTrigger(msg) {
-  if (!msg || !msg.content) return false;
-  const c = msg.content.toLowerCase();
-  return (
-    c.includes('summarize this') ||
-    c.includes('process this') ||
-    c.includes('please process') ||
-    c.includes('lav en opsummering') // dk flavour if you ever use it
-  );
+// Robust JSON body parsing for Catalyst Advanced I/O
+function parseJsonBody(request) {
+  if (!request) return {};
+
+  // If Catalyst already parsed JSON into an object
+  if (request.body && typeof request.body === 'object' && !Buffer.isBuffer(request.body)) {
+    return request.body;
+  }
+
+  const candidates = [request.body, request.rawBody, request.requestBody];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+
+    if (typeof candidate === 'string') {
+      const trimmed = candidate.trim();
+      if (!trimmed) return {};
+      return JSON.parse(trimmed);
+    }
+
+    if (Buffer.isBuffer(candidate)) {
+      const str = candidate.toString('utf8').trim();
+      if (!str) return {};
+      return JSON.parse(str);
+    }
+  }
+
+  return {};
 }
 
-// Discord message handler
-client.on('messageCreate', async (message) => {
+// Simple in-memory stores (per function instance / container)
+let TASKS = [];
+let PROJECTS = [];
+let NEXT_TASK_ID = 1;
+let NEXT_PROJECT_ID = 1;
+
+function sanitizeTask(input) {
+  const id = input.id || `t_${NEXT_TASK_ID++}`;
+
+  return {
+    id,
+    title:
+      typeof input.title === 'string' && input.title.trim()
+        ? input.title.trim()
+        : 'Untitled task',
+    context: typeof input.context === 'string' ? input.context : '',
+    status: input.status || 'open',
+    due: input.due || null,
+    priority_hint: input.priority_hint || null,
+    project_id: input.project_id || null,
+    project_hint: input.project_hint || null,
+    source_ref: input.source_ref || null
+  };
+}
+
+function sanitizeProject(input) {
+  const id = input.id || `p_${NEXT_PROJECT_ID++}`;
+
+  return {
+    id,
+    title:
+      typeof input.title === 'string' && input.title.trim()
+        ? input.title.trim()
+        : 'Untitled project',
+    context: typeof input.context === 'string' ? input.context : '',
+    status: input.status || 'open',
+    due: input.due || null,
+    importance: input.importance || null,
+    source_ref: input.source_ref || null
+  };
+}
+
+// ----------- Main handler -----------
+
+module.exports = async (request, response) => {
+  const url = request.url || '';
+  const method = (request.method || 'GET').toUpperCase();
+
   try {
-    // Ignore bot messages
-    if (message.author.bot) return;
+    // ---------- TASKS ----------
+    if (url.endsWith('/state/tasks') && method === 'GET') {
+      // Return all tasks currently in memory
+      return sendJson(response, 200, { tasks: TASKS });
+    }
 
-    const channelId = message.channel.id;
-
-    // 1) #agent-input: paste logs + trigger
-    if (channelId === DISCORD_INPUT_CHANNEL_ID && message.author.id === LUDVIG_USER_ID) {
-      if (isSummarizeTrigger(message)) {
-        await handleSummarizeTrigger(message);
+    if (url.endsWith('/state/tasks') && method === 'POST') {
+      let body;
+      try {
+        body = parseJsonBody(request);
+      } catch (err) {
+        console.error('Invalid JSON in POST /state/tasks:', err);
+        return sendJson(response, 400, { error: 'Invalid JSON body' });
       }
-      return;
+
+      const incomingTasks = Array.isArray(body.tasks) ? body.tasks : null;
+      if (!incomingTasks) {
+        return sendJson(response, 400, { error: 'Body must include tasks array' });
+      }
+
+      const savedTasks = [];
+      for (const raw of incomingTasks) {
+        if (!raw || typeof raw !== 'object') continue;
+        const sanitized = sanitizeTask(raw);
+        TASKS.push(sanitized);
+        savedTasks.push(sanitized);
+      }
+
+      console.log('[POST /state/tasks]', {
+        incomingCount: incomingTasks.length,
+        persisted: savedTasks.length
+      });
+
+      if (!savedTasks.length) {
+        return sendJson(response, 400, { error: 'No valid tasks provided' });
+      }
+
+      return sendJson(response, 200, { tasks: savedTasks });
     }
 
-    // 2) #ludvig-inbox: keep/drop confirmation
-    if (channelId === DISCORD_INBOX_CHANNEL_ID && message.author.id === LUDVIG_USER_ID) {
-      await handleKeepDrop(message);
-      return;
+    // ---------- PROJECTS (simple stub for now) ----------
+    if (url.endsWith('/state/projects') && method === 'GET') {
+      return sendJson(response, 200, { projects: PROJECTS });
     }
+
+    if (url.endsWith('/state/projects') && method === 'POST') {
+      let body;
+      try {
+        body = parseJsonBody(request);
+      } catch (err) {
+        console.error('Invalid JSON in POST /state/projects:', err);
+        return sendJson(response, 400, { error: 'Invalid JSON body' });
+      }
+
+      const incomingProjects = Array.isArray(body.projects) ? body.projects : null;
+      if (!incomingProjects) {
+        return sendJson(response, 400, { error: 'Body must include projects array' });
+      }
+
+      const savedProjects = [];
+      for (const raw of incomingProjects) {
+        if (!raw || typeof raw !== 'object') continue;
+        const sanitized = sanitizeProject(raw);
+        PROJECTS.push(sanitized);
+        savedProjects.push(sanitized);
+      }
+
+      console.log('[POST /state/projects]', {
+        incomingCount: incomingProjects.length,
+        persisted: savedProjects.length
+      });
+
+      if (!savedProjects.length) {
+        return sendJson(response, 400, { error: 'No valid projects provided' });
+      }
+
+      return sendJson(response, 200, { projects: savedProjects });
+    }
+
+    // ---------- Fallback ----------
+    return sendJson(response, 404, { error: 'Not found' });
   } catch (err) {
-    console.error('Error in messageCreate handler:', err);
-    await logToAgentLog(`messageCreate error: ${err.message}`);
+    console.error('Unhandled error in pa_state_api:', err);
+    return sendJson(response, 500, { error: 'Internal server error' });
   }
-});
-
-// ---------- Handlers ----------
-
-async function handleSummarizeTrigger(triggerMessage) {
-  const channel = triggerMessage.channel;
-
-  try {
-    await channel.send('Processing logs…');
-
-    // 1) Extract last log block from Ludvig before this trigger
-    const rawLogs = await extractLastLogBlock(channel, triggerMessage, LUDVIG_USER_ID);
-
-    if (!rawLogs) {
-      await channel.send('Could not find any logs above your trigger message.');
-      return;
-    }
-
-    // 2) Run summarizer workflow
-    const canonical = await runSummarizerWorkflow(rawLogs);
-
-    if (!canonical || typeof canonical !== 'object') {
-      await channel.send('Summarizer returned no structured data.');
-      await logToAgentLog('Summarizer returned invalid canonical_event.');
-      return;
-    }
-
-    const summaryText = canonical.content || '(no summary content)';
-    const tasks = Array.isArray(canonical.tasks) ? canonical.tasks : [];
-    const meta = canonical.meta || {};
-    const source = canonical.source || {};
-
-    // 3) Post summary in the SAME channel (#agent-input)
-    await channel.send(`**Summary:**\n${summaryText}`);
-
-    // 4) Post tasks in #ludvig-inbox
-    const inboxChannel = await client.channels.fetch(DISCORD_INBOX_CHANNEL_ID);
-    if (!inboxChannel || !inboxChannel.isTextBased()) {
-      await channel.send('Could not find #ludvig-inbox to post tasks.');
-      await logToAgentLog('DISCORD_INBOX_CHANNEL_ID not a text channel or not fetchable.');
-      return;
-    }
-
-    if (!tasks.length) {
-      await inboxChannel.send(
-        `No clear actionable tasks detected from the latest logs in <#${DISCORD_INPUT_CHANNEL_ID}>.`
-      );
-      lastTaskBatch = { tasks: [], sourceRef: null, meta: null };
-      return;
-    }
-
-    const listLines = tasks.map((t, idx) => {
-      const i = idx + 1;
-      const priority = t.priority_hint ? t.priority_hint.toUpperCase() : 'MEDIUM';
-      const title = t.title || '(no title)';
-      const context = t.context || '';
-      const due = t.due ? ` (due: ${t.due})` : '';
-      return `${i}. [${priority}] ${title}${due}\n    ${context}`;
-    });
-
-    const sourceRef =
-      canonical.source_ref ||
-      (source.channel
-        ? `discord:${source.channel}@${source.time_window || ''}`
-        : `discord:#agent-input@${meta.now || ''}`);
-
-    const taskMsg = [
-      `**Proposed tasks from latest logs in <#${DISCORD_INPUT_CHANNEL_ID}>:**`,
-      '',
-      ...listLines,
-      '',
-      '_Reply in this channel with `keep: 1,3` or `keep all` to store tasks in the PA._'
-    ].join('\n');
-
-    await inboxChannel.send(taskMsg);
-
-    // 5) Update in-memory batch
-    lastTaskBatch = {
-      tasks,
-      sourceRef,
-      meta
-    };
-  } catch (err) {
-    console.error('handleSummarizeTrigger error:', err);
-    await triggerMessage.channel.send('Error while processing logs.');
-    await logToAgentLog(`handleSummarizeTrigger error: ${err.message}`);
-  }
-}
-
-async function handleKeepDrop(message) {
-  try {
-    if (!lastTaskBatch.tasks.length) {
-      await message.reply('No pending tasks batch to confirm. Try processing new logs first.');
-      return;
-    }
-
-    const parsed = parseKeepDrop(message.content);
-    if (!parsed) {
-      // Not a keep/drop message – ignore silently
-      return;
-    }
-
-    let tasksToStore = [];
-
-    if (parsed.mode === 'all') {
-      tasksToStore = lastTaskBatch.tasks;
-    } else if (parsed.mode === 'indices') {
-      // Filter by 1-based indices
-      tasksToStore = parsed.indices
-        .map((i) => lastTaskBatch.tasks[i - 1])
-        .filter(Boolean);
-    }
-
-    if (!tasksToStore.length) {
-      await message.reply('No valid task numbers found to keep.');
-      return;
-    }
-
-    // Attach source_ref to each task if not present
-    const enriched = tasksToStore.map((t) => ({
-      ...t,
-      source_ref: t.source_ref || lastTaskBatch.sourceRef || null
-    }));
-
-    // Send to Catalyst
-    const createdTasks = await createTasksInCatalyst(enriched);
-
-    await message.reply(`Stored ${createdTasks.length} task(s) in the PA.`);
-    await logToAgentLog(
-      `keep success: sent ${enriched.length} task(s), Catalyst returned ${createdTasks.length}.`
-    );
-    // Clear batch after successful store
-    lastTaskBatch = { tasks: [], sourceRef: null, meta: null };
-  } catch (err) {
-    console.error('handleKeepDrop error:', err);
-    await message.reply('Error while storing tasks in the PA.');
-    await logToAgentLog(`keep error: ${err.message}`);
-  }
-}
-
-// ---------- HTTP server for Cloud Run ----------
-
-const PORT = process.env.PORT || 8080;
-
-const server = http.createServer((req, res) => {
-  if (req.url === '/' || req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('OK\n');
-    return;
-  }
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
-  res.end('Not found\n');
-});
-
-server.listen(PORT, () => {
-  console.log(`HTTP server listening on ${PORT}`);
-});
-
-// ---------- Start Discord client (only if config is OK) ----------
-
-if (!CAN_START_DISCORD) {
-  console.error(
-    '[startup] Discord bot not started because required env vars are missing. ' +
-      'HTTP health endpoint is running for Cloud Run. Fix env and redeploy to enable Discord.'
-  );
-} else {
-  client.login(DISCORD_TOKEN).catch((err) => {
-    console.error('Failed to login Discord client:', err);
-    logToAgentLog(`Failed to login Discord client: ${err.message}`);
-  });
-}
+};
