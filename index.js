@@ -7,8 +7,8 @@ import {
   Partials
 } from 'discord.js';
 
-import { runSummarizerWorkflow } from './services/openai.js';
-import { createTasksInCatalyst } from './services/catalyst.js';
+import { runSummarizerWorkflow, runDailyBriefingAgent } from './services/openai.js';
+import { createTasksInCatalyst, fetchTasksFromCatalyst } from './services/catalyst.js';
 import { parseKeepDrop } from './services/parseKeepDrop.js';
 import { extractLastLogBlock } from './services/extractLastLogBlock.js';
 
@@ -16,6 +16,7 @@ const {
   DISCORD_TOKEN,
   DISCORD_INPUT_CHANNEL_ID,
   DISCORD_INBOX_CHANNEL_ID,
+  DISCORD_DAILY_CHANNEL_ID,
   DISCORD_LOG_CHANNEL_ID,
   LUDVIG_USER_ID
 } = process.env;
@@ -39,18 +40,29 @@ const INBOX_OK =
   !!DISCORD_INBOX_CHANNEL_ID ||
   !envMissing('DISCORD_INBOX_CHANNEL_ID');
 
+const DAILY_OK =
+  !!DISCORD_DAILY_CHANNEL_ID ||
+  !envMissing('DISCORD_DAILY_CHANNEL_ID');
+
 const LUDVIG_OK =
   !!LUDVIG_USER_ID ||
   !envMissing('LUDVIG_USER_ID');
 
 const CAN_START_DISCORD =
-  DISCORD_CONFIG_OK && INPUT_OK && INBOX_OK && LUDVIG_OK;
+  DISCORD_CONFIG_OK && INPUT_OK && INBOX_OK && DAILY_OK && LUDVIG_OK;
 
 // In-memory last task batch (simple v1)
 let lastTaskBatch = {
   tasks: [],
   sourceRef: null,
   meta: null
+};
+
+// In-memory cache of last actionable list posted to #ludvig-inbox
+let lastListedTasks = {
+  tasks: [],
+  postedAt: null,
+  messageId: null
 };
 
 // ---------- Discord client ----------
@@ -112,9 +124,9 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // 2) #ludvig-inbox: keep/drop confirmation
+    // 2) #ludvig-inbox: keep/drop confirmation + task commands
     if (channelId === DISCORD_INBOX_CHANNEL_ID && message.author.id === LUDVIG_USER_ID) {
-      await handleKeepDrop(message);
+      await handleInboxMessage(message);
       return;
     }
   } catch (err) {
@@ -210,17 +222,28 @@ async function handleSummarizeTrigger(triggerMessage) {
   }
 }
 
+async function handleInboxMessage(message) {
+  const handledKeepDrop = await handleKeepDrop(message);
+  if (handledKeepDrop) return;
+
+  await handleTaskUpdateCommands(message);
+}
+
 async function handleKeepDrop(message) {
   try {
     if (!lastTaskBatch.tasks.length) {
-      await message.reply('No pending tasks batch to confirm. Try processing new logs first.');
-      return;
+      const parsed = parseKeepDrop(message.content);
+      if (parsed) {
+        await message.reply('No pending tasks batch to confirm. Try processing new logs first.');
+        return true;
+      }
+      return false;
     }
 
     const parsed = parseKeepDrop(message.content);
     if (!parsed) {
       // Not a keep/drop message – ignore silently
-      return;
+      return false;
     }
 
     let tasksToStore = [];
@@ -236,7 +259,7 @@ async function handleKeepDrop(message) {
 
     if (!tasksToStore.length) {
       await message.reply('No valid task numbers found to keep.');
-      return;
+      return true;
     }
 
     // Attach source_ref to each task if not present
@@ -254,11 +277,196 @@ async function handleKeepDrop(message) {
     );
     // Clear batch after successful store
     lastTaskBatch = { tasks: [], sourceRef: null, meta: null };
+    return true;
   } catch (err) {
     console.error('handleKeepDrop error:', err);
     await message.reply('Error while storing tasks in the PA.');
     await logToAgentLog(`keep error: ${err.message}`);
+    return true;
   }
+}
+
+async function handleTaskUpdateCommands(message) {
+  const parsed = parseTaskUpdateCommand(message.content);
+  if (!parsed) return false;
+
+  if (!lastListedTasks.tasks.length) {
+    await message.reply(
+      'No actionable list is cached right now. Trigger a daily briefing before using these commands.'
+    );
+    return true;
+  }
+
+  const selectedTasks = parsed.indices
+    .map((idx) => lastListedTasks.tasks[idx - 1])
+    .filter(Boolean);
+
+  if (!selectedTasks.length) {
+    await message.reply('No matching task numbers from the latest actionable list.');
+    return true;
+  }
+
+  try {
+    const payload = buildTaskCommandPayload(parsed, selectedTasks);
+    const updated = await createTasksInCatalyst(payload);
+
+    // Refresh cached list with returned values
+    updated.forEach((task) => {
+      const idx = lastListedTasks.tasks.findIndex((t) => t.id === task.id);
+      if (idx >= 0) {
+        lastListedTasks.tasks[idx] = {
+          ...lastListedTasks.tasks[idx],
+          ...task
+        };
+      }
+    });
+
+    await message.reply(parsed.replyText);
+  } catch (err) {
+    console.error('handleTaskUpdateCommands error:', err);
+    await message.reply('Failed to update the selected tasks in Catalyst.');
+    await logToAgentLog(`task command error: ${err.message}`);
+  }
+
+  return true;
+}
+
+function parseTaskUpdateCommand(content) {
+  if (!content) return null;
+  const trimmed = content.trim();
+  if (!trimmed) return null;
+
+  const doneMatch = trimmed.match(/^(done|remove|reopen)\s*:\s*(.+)$/i);
+  if (doneMatch) {
+    const action = doneMatch[1].toLowerCase();
+    const indices = parseIndices(doneMatch[2]);
+    if (!indices.length) return null;
+
+    const replyTextMap = {
+      done: `Marked tasks ${indices.join(', ')} as done.`,
+      remove: `Removed tasks ${indices.join(', ')} from the list.`,
+      reopen: `Reopened tasks ${indices.join(', ')}.`
+    };
+
+    return {
+      type: action,
+      indices,
+      replyText: replyTextMap[action]
+    };
+  }
+
+  const projectMatch = trimmed.match(/^project\s+([0-9,\s]+):\s*(.+)$/i);
+  if (projectMatch) {
+    const indices = parseIndices(projectMatch[1]);
+    const projectName = projectMatch[2].trim();
+    if (!indices.length || !projectName) return null;
+
+    return {
+      type: 'project',
+      indices,
+      projectName,
+      replyText: `Tagged tasks ${indices.join(', ')} with project "${projectName}".`
+    };
+  }
+
+  return null;
+}
+
+function parseIndices(text) {
+  if (!text) return [];
+  const parts = text
+    .split(/[,\s]+/)
+    .map((p) => parseInt(p, 10))
+    .filter((n) => Number.isInteger(n) && n > 0);
+  const unique = [...new Set(parts)];
+  return unique;
+}
+
+function buildTaskCommandPayload(parsed, selectedTasks) {
+  const updates = selectedTasks.map((task) => ({
+    id: task.id,
+    title: task.title,
+    context: task.context,
+    due: task.due,
+    priority_hint: task.priority_hint,
+    project_id: task.project_id,
+    project_hint: task.project_hint,
+    source_ref: task.source_ref,
+    status: task.status || 'open'
+  }));
+
+  switch (parsed.type) {
+    case 'done':
+      return updates.map((u) => ({ ...u, status: 'done' }));
+    case 'remove':
+      return updates.map((u) => ({ ...u, status: 'removed' }));
+    case 'reopen':
+      return updates.map((u) => ({ ...u, status: 'open' }));
+    case 'project':
+      return updates.map((u) => ({ ...u, project_hint: parsed.projectName }));
+    default:
+      return updates;
+  }
+}
+
+async function handleDailyBriefingRequest(res) {
+  try {
+    const tasks = await fetchTasksFromCatalyst();
+    const briefing = await runDailyBriefingAgent(tasks);
+
+    await postDailyBriefingToDiscord(briefing);
+
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Daily briefing posted.\n');
+  } catch (err) {
+    console.error('handleDailyBriefingRequest error:', err);
+    await logToAgentLog(`daily briefing error: ${err.message}`);
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end('Failed to post daily briefing.\n');
+  }
+}
+
+async function postDailyBriefingToDiscord(briefing) {
+  if (!briefing) {
+    throw new Error('No daily briefing payload was generated.');
+  }
+
+  const { daily_message, actionable_list } = briefing;
+
+  if (daily_message) {
+    await sendToChannel(DISCORD_DAILY_CHANNEL_ID, daily_message);
+  }
+
+  if (actionable_list?.message) {
+    const inboxChannel = await client.channels.fetch(DISCORD_INBOX_CHANNEL_ID);
+    if (!inboxChannel || !inboxChannel.isTextBased()) {
+      throw new Error('Unable to post actionable list – inbox channel missing.');
+    }
+
+    const sent = await inboxChannel.send(actionable_list.message);
+    storeLastListedTasks(actionable_list.tasks || [], sent?.id || null);
+  } else {
+    storeLastListedTasks([], null);
+  }
+}
+
+async function sendToChannel(channelId, content) {
+  if (!channelId) return;
+  const channel = await client.channels.fetch(channelId);
+  if (!channel || !channel.isTextBased()) {
+    throw new Error(`Channel ${channelId} is not accessible or text-based.`);
+  }
+  await channel.send(content);
+}
+
+function storeLastListedTasks(tasks, messageId) {
+  lastListedTasks = {
+    tasks: Array.isArray(tasks)
+      ? tasks.filter((task) => task && task.id)
+      : [],
+    postedAt: new Date().toISOString(),
+    messageId: messageId || null
+  };
 }
 
 // ---------- HTTP server for Cloud Run ----------
@@ -271,6 +479,12 @@ const server = http.createServer((req, res) => {
     res.end('OK\n');
     return;
   }
+
+  if (req.url === '/cron/daily-briefing' && req.method === 'GET') {
+    handleDailyBriefingRequest(res);
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('Not found\n');
 });
